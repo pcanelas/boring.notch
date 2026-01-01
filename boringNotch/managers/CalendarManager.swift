@@ -57,6 +57,54 @@ class CalendarManager: ObservableObject {
                 if Defaults[.calendarEventNotificationsEnabled] {
                     await self?.scheduleEventAlarms()
                 }
+                await self?.validateActiveCalendarEvent()
+                await self?.checkForActiveEvent()
+            }
+        }
+    }
+
+    private func validateActiveCalendarEvent() async {
+        guard let activeEventID = BoringViewCoordinator.shared.activeCalendarEvent.eventID else { return }
+
+        // Check if the active event still exists
+        guard let currentEvent = await calendarService.event(withIdentifier: activeEventID) else {
+            // Event was deleted, clear the active event (will check for next automatically)
+            BoringViewCoordinator.shared.clearActiveCalendarEvent()
+            return
+        }
+
+        let now = Date()
+
+        // If event has already ended, clear it (will check for next automatically)
+        if currentEvent.end <= now {
+            BoringViewCoordinator.shared.clearActiveCalendarEvent()
+            return
+        }
+
+        // Event still exists, check if times have changed
+        let activeEvent = BoringViewCoordinator.shared.activeCalendarEvent
+        if currentEvent.start != activeEvent.eventStartTime || currentEvent.end != activeEvent.eventEndTime {
+            // If event moved to the past (beyond grace period), clear it
+            if currentEvent.end.addingTimeInterval(2.0) <= now {
+                BoringViewCoordinator.shared.clearActiveCalendarEvent()
+            } else {
+                // Event times changed but still valid, update the active event
+                let notificationTime = currentEvent.alarms.first?.triggerDate(for: currentEvent.start) ??
+                                      currentEvent.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+                // Only update if we're within the notification window
+                if now >= notificationTime && currentEvent.end.addingTimeInterval(2.0) > now {
+                    BoringViewCoordinator.shared.setActiveCalendarEvent(
+                        eventID: currentEvent.id,
+                        title: currentEvent.title,
+                        startTime: currentEvent.start,
+                        endTime: currentEvent.end,
+                        notificationTime: notificationTime
+                    )
+                } else {
+                    // Event moved but we're not in notification window anymore or it's too far in the past
+                    BoringViewCoordinator.shared.clearActiveCalendarEvent()
+                }
             }
         }
     }
@@ -216,6 +264,46 @@ class CalendarManager: ObservableObject {
 
         Task { @MainActor in
             await scheduleEventAlarms()
+            await checkForActiveEvent()
+        }
+    }
+
+    private func checkForActiveEvent() async {
+        // Check if there's an event currently in progress or with active notification
+        let now = Date()
+        let endOfDay = Calendar.current.date(byAdding: .hour, value: 8, to: now)!
+
+        let upcomingEvents = await calendarService.events(
+            from: now.addingTimeInterval(-3600), // Look back 1 hour
+            to: endOfDay,
+            calendars: selectedCalendars.map { $0.id }
+        )
+
+        // Filter for events within their notification window
+        let relevantEvents = upcomingEvents.filter { event in
+            guard !event.isAllDay && event.end > now else { return false }
+
+            // Calculate notification time
+            let notificationTime = event.alarms.first?.triggerDate(for: event.start) ??
+                                  event.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+            // Only include if we're within notification window
+            return now >= notificationTime
+        }.sorted { $0.start < $1.start }
+
+        // Activate the first relevant event if we don't have an active one
+        if let firstEvent = relevantEvents.first,
+           !BoringViewCoordinator.shared.activeCalendarEvent.isActive {
+            let notificationTime = firstEvent.alarms.first?.triggerDate(for: firstEvent.start) ??
+                                  firstEvent.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+            BoringViewCoordinator.shared.setActiveCalendarEvent(
+                eventID: firstEvent.id,
+                title: firstEvent.title,
+                startTime: firstEvent.start,
+                endTime: firstEvent.end,
+                notificationTime: notificationTime
+            )
         }
     }
 
@@ -227,6 +315,89 @@ class CalendarManager: ObservableObject {
         currentNotificationWorkItem?.cancel()
         currentNotificationWorkItem = nil
         pendingNotifications.removeAll()
+    }
+
+    func hasNextEventWaiting(excludingEventID: String?) -> Bool {
+        let now = Date()
+
+        return pendingNotifications.contains { notification in
+            let event = notification.event
+            // Check if this is a different event
+            guard event.id != excludingEventID else { return false }
+            // Event must not have ended
+            guard event.end.addingTimeInterval(2.0) > now else { return false }
+            // Calculate its notification time
+            let notificationTime = event.alarms.first?.triggerDate(for: event.start) ??
+                                  event.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+            // Must be within notification window
+            return now >= notificationTime
+        }
+    }
+
+    func activateNextPendingEvent() {
+        // Run all logic inside Task to prevent race conditions from multiple calls
+        Task { @MainActor in
+            let now = Date()
+
+            // Find events that are upcoming or in progress and within notification window
+            // Use stale data for initial filtering, but will re-fetch before activating
+            let relevantEvents = pendingNotifications.filter { notification in
+                let event = notification.event
+
+                // Must not have ended (with grace period)
+                guard event.end.addingTimeInterval(2.0) > now else { return false }
+
+                // Calculate notification time
+                let notificationTime = event.alarms.first?.triggerDate(for: event.start) ??
+                                      event.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+                // Only include if we're within notification window
+                return now >= notificationTime
+            }
+
+            // Sort by start time to get the next chronological event
+            guard let nextEvent = relevantEvents.sorted(by: { $0.event.start < $1.event.start }).first else {
+                return
+            }
+
+            // CRITICAL: Re-fetch the event from EventKit to get current (non-stale) data
+            // Events in pendingNotifications may have been modified since they were added
+            guard let currentEvent = await calendarService.event(withIdentifier: nextEvent.event.id) else {
+                // Event was deleted, remove and try next one
+                pendingNotifications.removeAll { $0.event.id == nextEvent.event.id }
+                activateNextPendingEvent()
+                return
+            }
+
+            let nowRefreshed = Date()
+
+            // Validate with current event data, not stale data
+            guard currentEvent.end.addingTimeInterval(2.0) > nowRefreshed else {
+                // Event has ended, remove and try next
+                pendingNotifications.removeAll { $0.event.id == currentEvent.id }
+                activateNextPendingEvent()
+                return
+            }
+
+            // Calculate notification time with current event data
+            let notificationTime = currentEvent.alarms.first?.triggerDate(for: currentEvent.start) ??
+                                  currentEvent.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+            // Only activate if we're within notification window
+            guard nowRefreshed >= notificationTime else {
+                // Not in notification window yet, don't activate
+                return
+            }
+
+            // Activate with current (non-stale) event data
+            BoringViewCoordinator.shared.setActiveCalendarEvent(
+                eventID: currentEvent.id,
+                title: currentEvent.title,
+                startTime: currentEvent.start,
+                endTime: currentEvent.end,
+                notificationTime: notificationTime
+            )
+        }
     }
 
     private func scheduleEventAlarms() async {
@@ -338,16 +509,26 @@ class CalendarManager: ObservableObject {
     }
 
     private func processNextNotification() {
-        // Remove expired/outdated notifications
+        // Remove events that have already ended (with grace period for completion animation)
         let now = Date()
-        pendingNotifications.removeAll { now.timeIntervalSince($0.triggerTime) > 60 }
+        pendingNotifications.removeAll { $0.event.end.addingTimeInterval(2.0) < now }
 
         guard !pendingNotifications.isEmpty else {
             currentNotificationWorkItem = nil
             return
         }
 
-        let next = pendingNotifications[0]
+        // Find the first event that hasn't been shown yet
+        guard let nextIndex = pendingNotifications.firstIndex(where: { now.timeIntervalSince($0.triggerTime) < 60 }) else {
+            // All events were already shown, just wait
+            currentNotificationWorkItem = nil
+            return
+        }
+
+        let next = pendingNotifications[nextIndex]
+
+        // Mark this event as shown by updating its trigger time
+        pendingNotifications[nextIndex] = (event: next.event, triggerTime: Date.distantPast)
 
         // Play sound and show notification
         if let sound = NSSound(named: "Glass") {
@@ -362,13 +543,29 @@ class CalendarManager: ObservableObject {
             eventStartTime: next.event.start
         )
 
+        // Set the active calendar event for persistent tracking
+        let coordinator = BoringViewCoordinator.shared
+        let shouldReplace = !coordinator.activeCalendarEvent.isActive ||
+                           next.event.start < coordinator.activeCalendarEvent.eventStartTime ||
+                           Date() >= coordinator.activeCalendarEvent.eventEndTime
+
+        if shouldReplace {
+            // Calculate the notification time (when the alert was/will be triggered)
+            let notificationTime = next.event.alarms.first?.triggerDate(for: next.event.start) ??
+                                  next.event.start.addingTimeInterval(-TimeInterval(Defaults[.calendarEventNotificationMinutes] * 60))
+
+            coordinator.setActiveCalendarEvent(
+                eventID: next.event.id,
+                title: next.event.title,
+                startTime: next.event.start,
+                endTime: next.event.end,
+                notificationTime: notificationTime
+            )
+        }
+
         // Schedule next notification after 8 seconds
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            // Remove the event we just showed
-            if !self.pendingNotifications.isEmpty {
-                self.pendingNotifications.removeFirst()
-            }
             // Process next
             self.processNextNotification()
         }

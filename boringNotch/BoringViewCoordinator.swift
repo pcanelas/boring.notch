@@ -30,6 +30,33 @@ struct sneakPeek {
     var eventStartTime: Date = Date()
 }
 
+struct CalendarEventTracker {
+    var eventID: String?
+    var eventTitle: String = ""
+    var eventStartTime: Date = Date()
+    var eventEndTime: Date = Date()
+    var notificationTime: Date = Date()
+
+    var isActive: Bool {
+        guard eventID != nil else { return false }
+        let now = Date()
+        // Allow staying active for 2 seconds past end time for completion animation
+        // Only active if within notification window
+        return eventEndTime.addingTimeInterval(2.0) > now && now >= notificationTime
+    }
+
+    var isInProgress: Bool {
+        guard isActive else { return false }
+        let now = Date()
+        return now >= eventStartTime && now < eventEndTime
+    }
+
+    var isUpcoming: Bool {
+        guard isActive else { return false }
+        return Date() < eventStartTime
+    }
+}
+
 struct SharedSneakPeek: Codable {
     var show: Bool
     var type: String
@@ -264,6 +291,9 @@ class BoringViewCoordinator: ObservableObject {
         }
     }
 
+    @Published var activeCalendarEvent: CalendarEventTracker = .init()
+    private var calendarEventTimer: Timer?
+
     func toggleExpandingView(
         status: Bool,
         type: SneakContentType,
@@ -301,5 +331,91 @@ class BoringViewCoordinator: ObservableObject {
     
     func showEmpty() {
         currentView = .home
+    }
+
+    func setActiveCalendarEvent(eventID: String, title: String, startTime: Date, endTime: Date, notificationTime: Date) {
+        let now = Date()
+
+        // Don't set events that have already ended (past the grace period)
+        guard endTime.addingTimeInterval(2.0) > now else {
+            // Event is in the past, check for next one instead
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(100))
+                CalendarManager.shared.activateNextPendingEvent()
+            }
+            return
+        }
+
+        // Don't set if we're not within notification window
+        guard now >= notificationTime else { return }
+
+        Task { @MainActor in
+            withAnimation(.smooth) {
+                activeCalendarEvent = CalendarEventTracker(
+                    eventID: eventID,
+                    eventTitle: title,
+                    eventStartTime: startTime,
+                    eventEndTime: endTime,
+                    notificationTime: notificationTime
+                )
+            }
+            startCalendarEventTimer()
+        }
+    }
+
+    func clearActiveCalendarEvent(checkForNext: Bool = true) {
+        let wasActive = activeCalendarEvent.isActive
+        stopCalendarEventTimer()
+        withAnimation(.smooth) {
+            activeCalendarEvent = .init()
+        }
+        // Check for next event after clearing, only if there was an active event
+        if checkForNext && wasActive {
+            Task { @MainActor in
+                // Small delay to let the clear animation finish
+                try? await Task.sleep(for: .milliseconds(600))
+                CalendarManager.shared.activateNextPendingEvent()
+            }
+        }
+    }
+
+    private func startCalendarEventTimer() {
+        stopCalendarEventTimer()
+        calendarEventTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+
+                // Only process if there's an active event ID
+                guard self.activeCalendarEvent.eventID != nil else { return }
+
+                let now = Date()
+
+                // Check for invalid state (end time before start time)
+                if self.activeCalendarEvent.eventEndTime <= self.activeCalendarEvent.eventStartTime {
+                    self.clearActiveCalendarEvent()
+                    return
+                }
+
+                // Check if there's a next event waiting - if so, clear 3 seconds early to make room
+                let hasNextEvent = CalendarManager.shared.hasNextEventWaiting(excludingEventID: self.activeCalendarEvent.eventID)
+
+                // Clear earlier if next event is waiting, otherwise use normal grace period
+                let clearTime = hasNextEvent
+                    ? self.activeCalendarEvent.eventEndTime.addingTimeInterval(-3.0)  // 3s before end if next event waiting
+                    : self.activeCalendarEvent.eventEndTime.addingTimeInterval(2.0)   // 2s after end otherwise
+
+                if now >= clearTime {
+                    self.clearActiveCalendarEvent()
+                } else {
+                    // Force refresh by triggering objectWillChange for progress bar animation
+                    self.objectWillChange.send()
+                }
+            }
+        }
+    }
+
+    private func stopCalendarEventTimer() {
+        calendarEventTimer?.invalidate()
+        calendarEventTimer = nil
     }
 }

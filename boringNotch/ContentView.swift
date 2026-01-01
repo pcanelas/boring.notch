@@ -288,6 +288,8 @@ struct ContentView: View {
                               eventStartTime: coordinator.sneakPeek.eventStartTime,
                               style: .inline
                           )
+                      } else if coordinator.activeCalendarEvent.isActive && vm.notchState == .closed && (!coordinator.sneakPeek.show || (coordinator.sneakPeek.type != .calendarEvent || Defaults[.calendarNotificationBarStyle] == .default)) {
+                          CalendarEventPersistentIndicator()
                       } else if coordinator.sneakPeek.show && Defaults[.inlineHUD] && (coordinator.sneakPeek.type != .music) && (coordinator.sneakPeek.type != .battery) && (coordinator.sneakPeek.type != .calendarEvent) && vm.notchState == .closed {
                           InlineHUD(type: $coordinator.sneakPeek.type, value: $coordinator.sneakPeek.value, icon: $coordinator.sneakPeek.icon, hoverAnimation: $isHovering, gestureProgress: $gestureProgress)
                               .transition(.opacity)
@@ -660,6 +662,101 @@ struct GeneralDropTargetDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         return false
+    }
+}
+
+private struct CalendarEventPersistentIndicator: View {
+    @ObservedObject var coordinator = BoringViewCoordinator.shared
+    @EnvironmentObject var vm: BoringViewModel
+
+    private var timeUntilEvent: TimeInterval {
+        coordinator.activeCalendarEvent.eventStartTime.timeIntervalSinceNow
+    }
+
+    private var eventProgress: CGFloat {
+        guard coordinator.activeCalendarEvent.isActive else { return 0 }
+        let now = Date()
+
+        // If past the end time, show as complete (100%)
+        if now >= coordinator.activeCalendarEvent.eventEndTime {
+            return 1.0
+        }
+
+        guard coordinator.activeCalendarEvent.isInProgress else { return 0 }
+        let total = coordinator.activeCalendarEvent.eventEndTime.timeIntervalSince(coordinator.activeCalendarEvent.eventStartTime)
+        let elapsed = now.timeIntervalSince(coordinator.activeCalendarEvent.eventStartTime)
+        return CGFloat(min(1.0, max(0.0, elapsed / total)))
+    }
+
+    private var countdownText: String {
+        let seconds = max(0, Int(timeUntilEvent))
+        if seconds >= 60 {
+            let minutes = seconds / 60
+            return "\(minutes)m"
+        } else {
+            return "\(seconds)s"
+        }
+    }
+
+    private var shouldShowCountdown: Bool {
+        coordinator.activeCalendarEvent.isUpcoming && Int(timeUntilEvent) > 0
+    }
+
+    private var shouldShowProgress: Bool {
+        guard coordinator.activeCalendarEvent.isActive else { return false }
+        let now = Date()
+        // Show progress if in progress, or if we just passed the start time
+        return now >= coordinator.activeCalendarEvent.eventStartTime || Int(timeUntilEvent) <= 0
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // Left side - calendar icon with accent color
+            Image(systemName: "calendar")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.effectiveAccent)
+                .frame(width: 20)
+                .padding(.leading, 8)
+
+            Spacer()
+                .frame(width: vm.closedNotchSize.width + 10)
+
+            // Right side - countdown or progress
+            ZStack {
+                if shouldShowCountdown {
+                    Text(countdownText)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.effectiveAccent)
+                        .frame(width: 30, alignment: .trailing)
+                        .padding(.trailing, 8)
+                        .transition(.asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.8)),
+                            removal: .opacity.combined(with: .scale(scale: 0.8))
+                        ))
+                } else if shouldShowProgress {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.effectiveAccent.opacity(0.3), lineWidth: 2)
+                            .frame(width: 14, height: 14)
+
+                        Circle()
+                            .trim(from: 0, to: 1 - eventProgress)
+                            .stroke(Color.effectiveAccent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .frame(width: 14, height: 14)
+                            .rotationEffect(.degrees(-90))
+                            .animation(.linear(duration: 1), value: eventProgress)
+                    }
+                    .frame(width: 30, alignment: .trailing)
+                    .padding(.trailing, 8)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.8)),
+                        removal: .opacity.combined(with: .scale(scale: 0.8))
+                    ))
+                }
+            }
+            .animation(.smooth(duration: 0.4), value: shouldShowProgress)
+        }
+        .frame(height: vm.effectiveClosedNotchHeight)
     }
 }
 
